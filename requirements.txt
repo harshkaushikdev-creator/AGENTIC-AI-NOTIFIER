@@ -1,0 +1,11 @@
+requests
+httpx
+beautifulsoup4
+python-dotenv
+apscheduler
+langchain
+langchain-core
+langchain-groq
+langgraph
+gradio
+python-dateutil
