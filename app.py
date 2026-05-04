@@ -97,7 +97,9 @@ def send_email(to: str, subject: str, body: str):
     msg["To"]      = to
     msg["Subject"] = subject
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+    with smtplib.SMTP("smtp.gmail.com", 587) as s:
+        s.ehlo()
+        s.starttls()
         s.login(gmail_user, gmail_pass)
         s.sendmail(gmail_user, to, msg.as_string())
 
