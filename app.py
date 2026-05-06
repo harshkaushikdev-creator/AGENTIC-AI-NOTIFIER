@@ -8,8 +8,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 import gradio as gr
-import sendgrid
-from sendgrid.helpers.mail import Mail
+
 
 load_dotenv()
 
