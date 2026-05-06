@@ -88,7 +88,9 @@ def generate_briefing(state: State) -> State:
 def send_email(to: str, subject: str, body: str):
     gmail_user = os.getenv("GMAIL_USER")
     gmail_pass = os.getenv("GMAIL_APP_PASSWORD")
+    print(f"Attempting email to {to}, user={gmail_user}, pass_set={bool(gmail_pass)}")
     if not gmail_user or not gmail_pass:
+        print("Email credentials missing — skipping")
         return
 
     from email.mime.text import MIMEText
