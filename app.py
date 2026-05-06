@@ -1,10 +1,9 @@
-import os, re, json
+import os, re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import TypedDict, List, Optional
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
@@ -14,15 +13,9 @@ from email.mime.text import MIMEText
 
 load_dotenv()
 
-IST = ZoneInfo("Asia/Kolkata")
-llm = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", temperature=0.3)
-
-# FIX 2: persistent SQLite jobstore + misfire grace time
-scheduler = BackgroundScheduler(
-    timezone=IST,
-    jobstores={"default": SQLAlchemyJobStore(url="sqlite:///jobs.db")},
-    job_defaults={"coalesce": True, "misfire_grace_time": 300}
-)
+IST       = ZoneInfo("Asia/Kolkata")
+llm       = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", temperature=0.3)
+scheduler = BackgroundScheduler(timezone=IST)
 scheduler.start()
 
 
@@ -114,18 +107,16 @@ def run_job(topics: List[str], email: Optional[str]):
         send_email(email, f"Daily Briefing: {', '.join(topics)}", result["briefing"])
 
 
-# FIX 1: stronger prompt so LLM correctly classifies "daily" vs "at_time"
 def parse_message(msg: str, prev_email: Optional[str]) -> dict:
+    import json
     resp = llm.invoke([
         SystemMessage(content=(
             "Extract from the user message and return ONLY valid JSON with keys:\n"
-            '- "topics": list of news topic strings\n'
+            '- "topics": list of news topics (strings)\n'
             '- "email": email address or null\n'
             '- "schedule": "now" | "in_minutes" | "at_time" | "daily"\n'
-            '- "value": integer minutes if in_minutes, "HH:MM" 24hr string if at_time/daily, null if now\n\n'
-            'USE "daily" if message has: "every day", "daily", "each day", "everyday", "every morning/evening/night"\n'
-            'USE "at_time" ONLY for a single one-time delivery\n'
-            'ALWAYS convert to 24hr: "9:20 PM"→"21:20", "8 AM"→"08:00", "9 PM"→"21:00"'
+            '- "value": minutes as int if in_minutes, "HH:MM" string if at_time or daily, null if now\n'
+            'Use "daily" schedule if user says "every day", "daily", "each day", "every morning/evening" etc.'
         )),
         HumanMessage(content=msg)
     ])
@@ -133,7 +124,6 @@ def parse_message(msg: str, prev_email: Optional[str]) -> dict:
         raw    = re.sub(r"```json|```", "", resp.content).strip()
         parsed = json.loads(raw)
         parsed["email"] = parsed.get("email") or prev_email
-        print(f"DEBUG parsed: {parsed}")
         return parsed
     except:
         return {"topics": ["technology"], "email": prev_email, "schedule": "now", "value": None}
@@ -191,11 +181,12 @@ def chat(message: str, history: list) -> str:
         t      = dp.parse(str(value)) if value else datetime.now(IST).replace(hour=9, minute=0)
         hour   = t.hour
         minute = t.minute
-        # FIX 3: safe job_id when email is None
-        job_id = f"daily_{email or 'noemail'}_{','.join(sorted(topics))}"
+        job_id = f"daily_{email}_{','.join(topics)}"
         scheduler.add_job(
-            run_job, "cron",
-            hour=hour, minute=minute,
+            run_job,
+            "cron",
+            hour=hour,
+            minute=minute,
             timezone=IST,
             args=[topics, email],
             id=job_id,
