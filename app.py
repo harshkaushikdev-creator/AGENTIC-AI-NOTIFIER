@@ -1,6 +1,6 @@
-import requests
-import os, re, threading
+import os, re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import TypedDict, List, Optional
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -8,13 +8,16 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 import gradio as gr
-
+import smtplib
+from email.mime.text import MIMEText
 
 load_dotenv()
 
+IST       = ZoneInfo("Asia/Kolkata")
 llm       = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", temperature=0.3)
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(timezone=IST)
 scheduler.start()
+
 
 class State(TypedDict):
     topics:    List[str]
@@ -30,7 +33,7 @@ def scrape_news(state: State) -> State:
     sources   = []
     query     = " ".join(state["topics"])
     try:
-        r        = httpx.get("https://gnews.io/api/v4/search", params={
+        r = httpx.get("https://gnews.io/api/v4/search", params={
             "q": query, "token": os.environ.get("GNEWS_API_KEY"),
             "lang": "en", "max": 20, "sortby": "publishedAt",
         }, timeout=10)
@@ -54,7 +57,7 @@ def generate_briefing(state: State) -> State:
     bullets = "\n".join(f"- {h}" for h in state["headlines"])
     resp = llm.invoke([
         SystemMessage(content=(
-            f"You are a news briefing assistant. Today is {datetime.now().strftime('%B %d, %Y')}.\n"
+            f"You are a news briefing assistant. Today is {datetime.now(IST).strftime('%B %d, %Y')}.\n"
             "Write a clean briefing from these headlines. Group by sub-topic, add 1 line of context "
             "per item, end with a 2-line Key Takeaway. Keep it under 400 words."
         )),
@@ -68,19 +71,20 @@ def generate_briefing(state: State) -> State:
 
 
 def send_email(to: str, subject: str, body: str):
-    import resend
-    resend.api_key = os.environ.get("RESEND_API_KEY")
-    if not resend.api_key:
-        print("Resend API key not set")
+    gmail_user = os.environ.get("GMAIL_USER")
+    gmail_pass = os.environ.get("GMAIL_APP_PASS")
+    if not gmail_user or not gmail_pass:
+        print("Gmail credentials not set")
         return
     try:
-        r = resend.Emails.send({
-            "from":    "News Agent <onboarding@resend.dev>",
-            "to":      to,
-            "subject": subject,
-            "text":    body,
-        })
-        print(f"Email sent: {r}")
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"]    = gmail_user
+        msg["To"]      = to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, to, msg.as_string())
+        print(f"Email sent to {to}")
     except Exception as e:
         print(f"Email error: {e}")
 
@@ -100,7 +104,7 @@ graph = build_graph()
 def run_job(topics: List[str], email: Optional[str]):
     result = graph.invoke({"topics": topics, "email": email, "headlines": [], "sources": [], "briefing": ""})
     if email:
-        send_email(email, f"Briefing: {', '.join(topics)}", result["briefing"])
+        send_email(email, f"Daily Briefing: {', '.join(topics)}", result["briefing"])
 
 
 def parse_message(msg: str, prev_email: Optional[str]) -> dict:
@@ -110,8 +114,9 @@ def parse_message(msg: str, prev_email: Optional[str]) -> dict:
             "Extract from the user message and return ONLY valid JSON with keys:\n"
             '- "topics": list of news topics (strings)\n'
             '- "email": email address or null\n'
-            '- "schedule": "now" | "in_minutes" | "at_time"\n'
-            '- "value": minutes as int if in_minutes, "HH:MM" string if at_time, null if now'
+            '- "schedule": "now" | "in_minutes" | "at_time" | "daily"\n'
+            '- "value": minutes as int if in_minutes, "HH:MM" string if at_time or daily, null if now\n'
+            'Use "daily" schedule if user says "every day", "daily", "each day", "every morning/evening" etc.'
         )),
         HumanMessage(content=msg)
     ])
@@ -155,23 +160,43 @@ def chat(message: str, history: list) -> str:
 
     elif schedule == "in_minutes":
         mins     = int(value) if value else 5
-        run_time = datetime.now() + timedelta(minutes=mins)
+        run_time = datetime.now(IST) + timedelta(minutes=mins)
         scheduler.add_job(run_job, "date", run_date=run_time, args=[topics, email])
-        return (f"✅ Recorded! **{', '.join(topics)}** briefing in **{mins} min** "
-                f"({run_time.strftime('%I:%M %p')}).{email_note}")
+        return (f"✅ Scheduled! **{', '.join(topics)}** briefing in **{mins} min** "
+                f"({run_time.strftime('%I:%M %p')} IST).{email_note}")
 
     elif schedule == "at_time":
         from dateutil import parser as dp
-        t        = dp.parse(str(value)) if value else datetime.now().replace(hour=9, minute=0)
-        now      = datetime.now()
+        t        = dp.parse(str(value)) if value else datetime.now(IST).replace(hour=9, minute=0)
+        now      = datetime.now(IST)
         run_time = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
         if run_time <= now:
             run_time += timedelta(days=1)
         scheduler.add_job(run_job, "date", run_date=run_time, args=[topics, email])
         return (f"✅ Scheduled! **{', '.join(topics)}** briefing at "
-                f"**{run_time.strftime('%I:%M %p')}**.{email_note}")
+                f"**{run_time.strftime('%I:%M %p')} IST**.{email_note}")
 
-    return "Try: *'Send me AI news now'* or *'cybersecurity news in 5 minutes to me@gmail.com'*"
+    elif schedule == "daily":
+        from dateutil import parser as dp
+        t      = dp.parse(str(value)) if value else datetime.now(IST).replace(hour=9, minute=0)
+        hour   = t.hour
+        minute = t.minute
+        job_id = f"daily_{email}_{','.join(topics)}"
+        scheduler.add_job(
+            run_job,
+            "cron",
+            hour=hour,
+            minute=minute,
+            timezone=IST,
+            args=[topics, email],
+            id=job_id,
+            replace_existing=True
+        )
+        return (f"✅ Daily briefing set! You'll get **{', '.join(topics)}** news "
+                f"every day at **{t.strftime('%I:%M %p')} IST**.{email_note}\n\n"
+                f"💡 To cancel, say: *'cancel my daily {', '.join(topics)} briefing'*")
+
+    return "Try: *'Send me AI news now'* or *'cybersecurity news every day at 8 AM to me@gmail.com'*"
 
 
 gr.ChatInterface(
@@ -181,7 +206,8 @@ gr.ChatInterface(
     examples=[
         "Send me AI news right now to harshkaushikagent@gmail.com",
         "Cybersecurity news in 5 minutes to harshkaushikagent@gmail.com",
-        "India Tech and startup news at 8 PM to harshkaushikagent@gmail.com",
+        "Send me AI news every day at 8 AM to harshkaushikagent@gmail.com",
+        "India Tech and startup news daily at 9 PM to harshkaushikagent@gmail.com",
     ],
 ).launch(
     server_name="0.0.0.0",
