@@ -8,8 +8,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 import gradio as gr
-import smtplib
-from email.mime.text import MIMEText
+import resend
 
 load_dotenv()
 
@@ -71,20 +70,18 @@ def generate_briefing(state: State) -> State:
 
 
 def send_email(to: str, subject: str, body: str):
-    gmail_user = os.environ.get("GMAIL_USER")
-    gmail_pass = os.environ.get("GMAIL_APP_PASS")
-    if not gmail_user or not gmail_pass:
-        print("Gmail credentials not set")
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+    if not resend.api_key:
+        print("Resend API key not set")
         return
     try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"]    = gmail_user
-        msg["To"]      = to
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(gmail_user, gmail_pass)
-            server.sendmail(gmail_user, to, msg.as_string())
-        print(f"Email sent to {to}")
+        r = resend.Emails.send({
+            "from":    "News Agent <onboarding@resend.dev>",
+            "to":      to,
+            "subject": subject,
+            "text":    body,
+        })
+        print(f"Email sent: {r}")
     except Exception as e:
         print(f"Email error: {e}")
 
@@ -116,7 +113,7 @@ def parse_message(msg: str, prev_email: Optional[str]) -> dict:
             '- "email": email address or null\n'
             '- "schedule": "now" | "in_minutes" | "at_time" | "daily"\n'
             '- "value": minutes as int if in_minutes, "HH:MM" string if at_time or daily, null if now\n'
-            'Use "daily" schedule if user says "every day", "daily", "each day", "every morning/evening" etc.'
+            'Use "daily" if user says "every day", "daily", "each day", "every morning/evening" etc.'
         )),
         HumanMessage(content=msg)
     ])
@@ -179,14 +176,10 @@ def chat(message: str, history: list) -> str:
     elif schedule == "daily":
         from dateutil import parser as dp
         t      = dp.parse(str(value)) if value else datetime.now(IST).replace(hour=9, minute=0)
-        hour   = t.hour
-        minute = t.minute
         job_id = f"daily_{email}_{','.join(topics)}"
         scheduler.add_job(
-            run_job,
-            "cron",
-            hour=hour,
-            minute=minute,
+            run_job, "cron",
+            hour=t.hour, minute=t.minute,
             timezone=IST,
             args=[topics, email],
             id=job_id,
@@ -194,7 +187,7 @@ def chat(message: str, history: list) -> str:
         )
         return (f"✅ Daily briefing set! You'll get **{', '.join(topics)}** news "
                 f"every day at **{t.strftime('%I:%M %p')} IST**.{email_note}\n\n"
-                f"💡 To cancel, say: *'cancel my daily {', '.join(topics)} briefing'*")
+                f"💡 To cancel say: *'cancel my daily {', '.join(topics)} briefing'*")
 
     return "Try: *'Send me AI news now'* or *'cybersecurity news every day at 8 AM to me@gmail.com'*"
 
@@ -212,6 +205,5 @@ gr.ChatInterface(
 ).launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 7860)),
-    share=False,
     show_error=True,
 )
