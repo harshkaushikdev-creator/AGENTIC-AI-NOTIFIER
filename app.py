@@ -176,7 +176,6 @@ def chat(message: str, history: list) -> str:
 
 gr.ChatInterface(
     fn=chat,
-    type="messages",
     title="📰 Autonomous News Briefing Agent",
     description="Tell me what news you want, when, and optionally your email.",
     examples=[
