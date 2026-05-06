@@ -6,3 +6,4 @@ python-dotenv
 httpx
 python-dateutil
 resend
+sqlalchemy
