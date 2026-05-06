@@ -1,5 +1,5 @@
 import requests
-import os, re, smtplib, threading
+import os, re, threading
 from datetime import datetime, timedelta
 from typing import TypedDict, List, Optional
 from dotenv import load_dotenv
@@ -8,15 +8,12 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 import gradio as gr
+import sendgrid
+from sendgrid.helpers.mail import Mail
 
 load_dotenv()
 
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
-GMAIL_USER        = os.environ.get("GMAIL_USER")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-GNEWS_API_KEY     = os.environ.get("GNEWS_API_KEY")
-
-llm       = ChatGroq(api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile", temperature=0.3)
+llm       = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3.3-70b-versatile", temperature=0.3)
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -30,33 +27,22 @@ class State(TypedDict):
 
 def scrape_news(state: State) -> State:
     import httpx
-
     headlines = []
     sources   = []
     query     = " ".join(state["topics"])
-
     try:
-        url = "https://gnews.io/api/v4/search"
-        params = {
-            "q":      query,
-            "token":  GNEWS_API_KEY,
-            "lang":   "en",
-            "max":    20,
-            "sortby": "publishedAt",
-        }
-        r        = httpx.get(url, params=params, timeout=10)
-        articles = r.json().get("articles", [])
-
-        for a in articles:
+        r        = httpx.get("https://gnews.io/api/v4/search", params={
+            "q": query, "token": os.environ.get("GNEWS_API_KEY"),
+            "lang": "en", "max": 20, "sortby": "publishedAt",
+        }, timeout=10)
+        for a in r.json().get("articles", []):
             title = a.get("title", "").strip()
             link  = a.get("url", "").strip()
             if title:
                 headlines.append(title)
                 sources.append({"title": title, "url": link})
-
     except Exception as e:
         print(f"GNews error: {e}")
-
     state["headlines"] = headlines
     state["sources"]   = sources
     return state
@@ -66,7 +52,6 @@ def generate_briefing(state: State) -> State:
     if not state["headlines"]:
         state["briefing"] = "No news found for your topics. Try different keywords."
         return state
-
     bullets = "\n".join(f"- {h}" for h in state["headlines"])
     resp = llm.invoke([
         SystemMessage(content=(
@@ -76,34 +61,29 @@ def generate_briefing(state: State) -> State:
         )),
         HumanMessage(content=f"Topics: {', '.join(state['topics'])}\n\nHeadlines:\n{bullets}")
     ])
-
     sources_text = "\n\n---\n📚 **Sources:**\n" + "\n".join(
-        f"- {s['title']} → {s['url']}"
-        for s in state.get("sources", []) if s.get("url")
+        f"- {s['title']} → {s['url']}" for s in state.get("sources", []) if s.get("url")
     )
     state["briefing"] = resp.content + sources_text
     return state
 
 
 def send_email(to: str, subject: str, body: str):
-    gmail_user = os.getenv("GMAIL_USER")
-    gmail_pass = os.getenv("GMAIL_APP_PASSWORD")
-    print(f"Attempting email to {to}, user={gmail_user}, pass_set={bool(gmail_pass)}")
-    if not gmail_user or not gmail_pass:
-        print("Email credentials missing — skipping")
+    import resend
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+    if not resend.api_key:
+        print("Resend API key not set")
         return
-
-    from email.mime.text import MIMEText
-    msg            = MIMEText(body)
-    msg["From"]    = gmail_user
-    msg["To"]      = to
-    msg["Subject"] = subject
-
-    with smtplib.SMTP("smtp.gmail.com", 587) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(gmail_user, gmail_pass)
-        s.sendmail(gmail_user, to, msg.as_string())
+    try:
+        r = resend.Emails.send({
+            "from":    "News Agent <onboarding@resend.dev>",
+            "to":      to,
+            "subject": subject,
+            "text":    body,
+        })
+        print(f"Email sent: {r}")
+    except Exception as e:
+        print(f"Email error: {e}")
 
 
 def build_graph():
@@ -137,7 +117,7 @@ def parse_message(msg: str, prev_email: Optional[str]) -> dict:
         HumanMessage(content=msg)
     ])
     try:
-        raw = re.sub(r"```json|```", "", resp.content).strip()
+        raw    = re.sub(r"```json|```", "", resp.content).strip()
         parsed = json.loads(raw)
         parsed["email"] = parsed.get("email") or prev_email
         return parsed
@@ -163,7 +143,7 @@ def chat(message: str, history: list) -> str:
     email    = p.get("email")
     schedule = p.get("schedule", "now")
     value    = p.get("value")
-    print(f"DEBUG parsed: topics={topics}, email={email}, schedule={schedule}")
+
     email_note = f"\n📬 Will be sent to **{email}**." if email else \
                  "\n💡 Add your email and I'll send it there too."
 
@@ -171,9 +151,7 @@ def chat(message: str, history: list) -> str:
         result   = graph.invoke({"topics": topics, "email": email, "headlines": [], "sources": [], "briefing": ""})
         briefing = result["briefing"]
         if email:
-            threading.Thread(target=send_email, args=(
-                email, f"Briefing: {', '.join(topics)}", briefing
-            )).start()
+            send_email(email, f"Briefing: {', '.join(topics)}", briefing)
         return f"📰 **Briefing: {', '.join(topics)}**{email_note}\n\n---\n\n{briefing}"
 
     elif schedule == "in_minutes":
@@ -199,6 +177,7 @@ def chat(message: str, history: list) -> str:
 
 gr.ChatInterface(
     fn=chat,
+    type="messages",
     title="📰 Autonomous News Briefing Agent",
     description="Tell me what news you want, when, and optionally your email.",
     examples=[
