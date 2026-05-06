@@ -163,7 +163,7 @@ def chat(message: str, history: list) -> str:
     email    = p.get("email")
     schedule = p.get("schedule", "now")
     value    = p.get("value")
-
+    print(f"DEBUG parsed: topics={topics}, email={email}, schedule={schedule}")
     email_note = f"\n📬 Will be sent to **{email}**." if email else \
                  "\n💡 Add your email and I'll send it there too."
 
