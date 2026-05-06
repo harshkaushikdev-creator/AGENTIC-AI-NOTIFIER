@@ -1,11 +1,8 @@
-requests
-httpx
-beautifulsoup4
-python-dotenv
-apscheduler
-langchain
-langchain-core
+gradio
 langchain-groq
 langgraph
-gradio
+apscheduler
+python-dotenv
+httpx
 python-dateutil
+resend
