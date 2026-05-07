@@ -17,20 +17,32 @@ llm       = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3
 scheduler = BackgroundScheduler(timezone=IST)
 scheduler.start()
 
+TOO_FEW  = 3   # retry if fewer than this
+TOO_MANY = 15  # filter if more than this
+
 
 class State(TypedDict):
-    topics:    List[str]
-    email:     Optional[str]
-    headlines: List[str]
-    sources:   List[dict]
-    briefing:  str
+    topics:       List[str]
+    email:        Optional[str]
+    headlines:    List[str]
+    sources:      List[dict]
+    briefing:     str
+    retry_count:  int
+    quality_note: str   # shown to user explaining what the agent did
 
 
+# ── Node 1: Scrape ─────────────────────────────────────────────────────────────
 def scrape_news(state: State) -> State:
     import httpx
     headlines = []
     sources   = []
     query     = " ".join(state["topics"])
+
+    # On retry, broaden the query by taking only the first topic keyword
+    if state.get("retry_count", 0) > 0:
+        query = state["topics"][0].split()[0]  # e.g. "Artificial Intelligence" → "AI"
+        print(f"Retrying with broader query: {query}")
+
     try:
         r = httpx.get("https://gnews.io/api/v4/search", params={
             "q": query, "token": os.environ.get("GNEWS_API_KEY"),
@@ -44,15 +56,59 @@ def scrape_news(state: State) -> State:
                 sources.append({"title": title, "url": link})
     except Exception as e:
         print(f"GNews error: {e}")
+
     state["headlines"] = headlines
     state["sources"]   = sources
     return state
 
 
+# ── Node 2: Evaluate quality ───────────────────────────────────────────────────
+def evaluate(state: State) -> State:
+    count = len(state["headlines"])
+    if count < TOO_FEW:
+        state["quality_note"] = f"⚠️ Only {count} articles found — retrying with broader query..."
+    elif count > TOO_MANY:
+        state["quality_note"] = f"📊 {count} articles found — filtering most relevant ones..."
+    else:
+        state["quality_note"] = f"✅ {count} articles found — generating briefing..."
+    print(state["quality_note"])
+    return state
+
+
+# ── Node 3: Filter (when too many articles) ────────────────────────────────────
+def filter_articles(state: State) -> State:
+    headlines = state["headlines"]
+    sources   = state["sources"]
+    topics    = state["topics"]
+
+    resp = llm.invoke([
+        SystemMessage(content=(
+            f"You are a news relevance filter. Topics of interest: {', '.join(topics)}.\n"
+            f"From the list below, return ONLY the indices (0-based, comma separated) of the "
+            f"top {TOO_FEW} to {TOO_MANY} most relevant and diverse articles. "
+            "Return ONLY numbers like: 0,2,5,7,11 — nothing else."
+        )),
+        HumanMessage(content="\n".join(f"{i}. {h}" for i, h in enumerate(headlines)))
+    ])
+
+    try:
+        indices = [int(x.strip()) for x in resp.content.strip().split(",") if x.strip().isdigit()]
+        indices = [i for i in indices if i < len(headlines)]
+        state["headlines"] = [headlines[i] for i in indices]
+        state["sources"]   = [sources[i] for i in indices]
+        print(f"Filtered to {len(state['headlines'])} articles")
+    except Exception as e:
+        print(f"Filter error: {e}")
+
+    return state
+
+
+# ── Node 4: Generate briefing ──────────────────────────────────────────────────
 def generate_briefing(state: State) -> State:
     if not state["headlines"]:
-        state["briefing"] = "No news found for your topics. Try different keywords."
+        state["briefing"] = "No news found even after retrying. Please try different keywords."
         return state
+
     bullets = "\n".join(f"- {h}" for h in state["headlines"])
     resp = llm.invoke([
         SystemMessage(content=(
@@ -62,6 +118,7 @@ def generate_briefing(state: State) -> State:
         )),
         HumanMessage(content=f"Topics: {', '.join(state['topics'])}\n\nHeadlines:\n{bullets}")
     ])
+
     sources_text = "\n\n---\n📚 **Sources:**\n" + "\n".join(
         f"- {s['title']} → {s['url']}" for s in state.get("sources", []) if s.get("url")
     )
@@ -69,6 +126,49 @@ def generate_briefing(state: State) -> State:
     return state
 
 
+# ── Routing logic ──────────────────────────────────────────────────────────────
+def route_after_evaluate(state: State) -> str:
+    count = len(state["headlines"])
+    if count < TOO_FEW and state.get("retry_count", 0) < 2:
+        return "retry"
+    elif count > TOO_MANY:
+        return "filter"
+    else:
+        return "brief"
+
+def increment_retry(state: State) -> State:
+    state["retry_count"] = state.get("retry_count", 0) + 1
+    return state
+
+
+# ── Build LangGraph ────────────────────────────────────────────────────────────
+def build_graph():
+    g = StateGraph(State)
+
+    g.add_node("scrape",   scrape_news)
+    g.add_node("evaluate", evaluate)
+    g.add_node("retry",    increment_retry)
+    g.add_node("filter",   filter_articles)
+    g.add_node("brief",    generate_briefing)
+
+    g.set_entry_point("scrape")
+    g.add_edge("scrape",   "evaluate")
+    g.add_edge("retry",    "scrape")      # retry loops back to scrape
+    g.add_edge("filter",   "brief")
+    g.add_edge("brief",    END)
+
+    g.add_conditional_edges("evaluate", route_after_evaluate, {
+        "retry":  "retry",
+        "filter": "filter",
+        "brief":  "brief",
+    })
+
+    return g.compile()
+
+graph = build_graph()
+
+
+# ── Email ──────────────────────────────────────────────────────────────────────
 def send_email(to: str, subject: str, body: str):
     resend.api_key = os.environ.get("RESEND_API_KEY")
     if not resend.api_key:
@@ -86,24 +186,18 @@ def send_email(to: str, subject: str, body: str):
         print(f"Email error: {e}")
 
 
-def build_graph():
-    g = StateGraph(State)
-    g.add_node("scrape", scrape_news)
-    g.add_node("brief",  generate_briefing)
-    g.set_entry_point("scrape")
-    g.add_edge("scrape", "brief")
-    g.add_edge("brief",  END)
-    return g.compile()
-
-graph = build_graph()
-
-
+# ── Scheduled job ──────────────────────────────────────────────────────────────
 def run_job(topics: List[str], email: Optional[str]):
-    result = graph.invoke({"topics": topics, "email": email, "headlines": [], "sources": [], "briefing": ""})
+    result = graph.invoke({
+        "topics": topics, "email": email,
+        "headlines": [], "sources": [], "briefing": "",
+        "retry_count": 0, "quality_note": ""
+    })
     if email:
         send_email(email, f"Daily Briefing: {', '.join(topics)}", result["briefing"])
 
 
+# ── Parse intent ──────────────────────────────────────────────────────────────
 def parse_message(msg: str, prev_email: Optional[str]) -> dict:
     import json
     resp = llm.invoke([
@@ -126,6 +220,7 @@ def parse_message(msg: str, prev_email: Optional[str]) -> dict:
         return {"topics": ["technology"], "email": prev_email, "schedule": "now", "value": None}
 
 
+# ── Gradio chat ────────────────────────────────────────────────────────────────
 def chat(message: str, history: list) -> str:
     prev_email = None
     for h in history:
@@ -149,11 +244,17 @@ def chat(message: str, history: list) -> str:
                  "\n💡 Add your email and I'll send it there too."
 
     if schedule == "now":
-        result   = graph.invoke({"topics": topics, "email": email, "headlines": [], "sources": [], "briefing": ""})
-        briefing = result["briefing"]
+        result   = graph.invoke({
+            "topics": topics, "email": email,
+            "headlines": [], "sources": [], "briefing": "",
+            "retry_count": 0, "quality_note": ""
+        })
+        briefing     = result["briefing"]
+        quality_note = result.get("quality_note", "")
         if email:
             send_email(email, f"Briefing: {', '.join(topics)}", briefing)
-        return f"📰 **Briefing: {', '.join(topics)}**{email_note}\n\n---\n\n{briefing}"
+        return (f"📰 **Briefing: {', '.join(topics)}**{email_note}\n"
+                f"_{quality_note}_\n\n---\n\n{briefing}")
 
     elif schedule == "in_minutes":
         mins     = int(value) if value else 5
@@ -194,13 +295,14 @@ def chat(message: str, history: list) -> str:
 
 gr.ChatInterface(
     fn=chat,
+    type="messages",
     title="📰 Autonomous News Briefing Agent",
     description="Tell me what news you want, when, and optionally your email.",
     examples=[
-        "Send me AI news right now to harshkaushikagent@gmail.com",
-        "Cybersecurity news in 5 minutes to harshkaushikagent@gmail.com",
-        "Send me AI news every day at 8 AM to harshkaushikagent@gmail.com",
-        "India Tech and startup news daily at 9 PM to harshkaushikagent@gmail.com",
+        "Send me AI news right now to harshkaushikdev@gmail.com",
+        "Cybersecurity news in 5 minutes to harshkaushikdev@gmail.com",
+        "Send me AI news every day at 8 AM to harshkaushikdev@gmail.com",
+        "India Tech and startup news daily at 9 PM to harshkaushikdev@gmail.com",
     ],
 ).launch(
     server_name="0.0.0.0",
