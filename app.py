@@ -17,8 +17,8 @@ llm       = ChatGroq(api_key=os.environ.get("GROQ_API_KEY"), model_name="llama-3
 scheduler = BackgroundScheduler(timezone=IST)
 scheduler.start()
 
-TOO_FEW  = 3   # retry if fewer than this
-TOO_MANY = 15  # filter if more than this
+TOO_FEW  = 3   
+TOO_MANY = 15 
 
 
 class State(TypedDict):
@@ -28,19 +28,19 @@ class State(TypedDict):
     sources:      List[dict]
     briefing:     str
     retry_count:  int
-    quality_note: str   # shown to user explaining what the agent did
+    quality_note: str   
 
 
-# ── Node 1: Scrape ─────────────────────────────────────────────────────────────
+
 def scrape_news(state: State) -> State:
     import httpx
     headlines = []
     sources   = []
     query     = " ".join(state["topics"])
 
-    # On retry, broaden the query by taking only the first topic keyword
+    
     if state.get("retry_count", 0) > 0:
-        query = state["topics"][0].split()[0]  # e.g. "Artificial Intelligence" → "AI"
+        query = state["topics"][0].split()[0]  
         print(f"Retrying with broader query: {query}")
 
     try:
@@ -62,7 +62,7 @@ def scrape_news(state: State) -> State:
     return state
 
 
-# ── Node 2: Evaluate quality ───────────────────────────────────────────────────
+
 def evaluate(state: State) -> State:
     count = len(state["headlines"])
     if count < TOO_FEW:
@@ -75,7 +75,7 @@ def evaluate(state: State) -> State:
     return state
 
 
-# ── Node 3: Filter (when too many articles) ────────────────────────────────────
+
 def filter_articles(state: State) -> State:
     headlines = state["headlines"]
     sources   = state["sources"]
@@ -103,7 +103,7 @@ def filter_articles(state: State) -> State:
     return state
 
 
-# ── Node 4: Generate briefing ──────────────────────────────────────────────────
+
 def generate_briefing(state: State) -> State:
     if not state["headlines"]:
         state["briefing"] = "No news found even after retrying. Please try different keywords."
@@ -126,7 +126,7 @@ def generate_briefing(state: State) -> State:
     return state
 
 
-# ── Routing logic ──────────────────────────────────────────────────────────────
+
 def route_after_evaluate(state: State) -> str:
     count = len(state["headlines"])
     if count < TOO_FEW and state.get("retry_count", 0) < 2:
@@ -141,7 +141,7 @@ def increment_retry(state: State) -> State:
     return state
 
 
-# ── Build LangGraph ────────────────────────────────────────────────────────────
+
 def build_graph():
     g = StateGraph(State)
 
@@ -153,7 +153,7 @@ def build_graph():
 
     g.set_entry_point("scrape")
     g.add_edge("scrape",   "evaluate")
-    g.add_edge("retry",    "scrape")      # retry loops back to scrape
+    g.add_edge("retry",    "scrape")      
     g.add_edge("filter",   "brief")
     g.add_edge("brief",    END)
 
@@ -168,7 +168,7 @@ def build_graph():
 graph = build_graph()
 
 
-# ── Email ──────────────────────────────────────────────────────────────────────
+
 def send_email(to: str, subject: str, body: str):
     resend.api_key = os.environ.get("RESEND_API_KEY")
     if not resend.api_key:
@@ -186,7 +186,7 @@ def send_email(to: str, subject: str, body: str):
         print(f"Email error: {e}")
 
 
-# ── Scheduled job ──────────────────────────────────────────────────────────────
+
 def run_job(topics: List[str], email: Optional[str]):
     result = graph.invoke({
         "topics": topics, "email": email,
@@ -197,7 +197,7 @@ def run_job(topics: List[str], email: Optional[str]):
         send_email(email, f"Daily Briefing: {', '.join(topics)}", result["briefing"])
 
 
-# ── Parse intent ──────────────────────────────────────────────────────────────
+
 def parse_message(msg: str, prev_email: Optional[str]) -> dict:
     import json
     resp = llm.invoke([
